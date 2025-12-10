@@ -27,7 +27,7 @@
 
 1.  **Download the script:**
     ```bash
-    wget [https://raw.githubusercontent.com/e29ckg/openvpn-manager/main/openvpn-manager.sh](https://raw.githubusercontent.com/e29ckg/openvpn-manager/main/openvpn-manager.sh)
+    wget https://raw.githubusercontent.com/e29ckg/openvpn-manager/main/openvpn-manager.sh
     # OR upload the file manually
     ```
 
