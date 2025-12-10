@@ -581,20 +581,26 @@ do_install() {
 }
 
 # ====== CLIENT MANAGEMENT ======
-
 build_client() {
     local name="$1"
     cd "$EASYRSA_DIR"
     export EASYRSA_BATCH=1
     
-    # ซ่อน Output ของ easyrsa ไม่ให้รกหน้าจอ
-    ./easyrsa gen-req "$name" nopass > /dev/null 2>&1
-    ./easyrsa sign-req client "$name" > /dev/null 2>&1
+    # 1. เพิ่ม Error Handling: ถ้าสร้าง Key ไม่ผ่าน ให้ฟ้อง Error ทันที
+    if ! ./easyrsa gen-req "$name" nopass > /dev/null 2>&1; then
+        echo "Error: Failed to generate request for $name" >&2
+        return 1
+    fi
+    
+    if ! ./easyrsa sign-req client "$name" > /dev/null 2>&1; then
+        echo "Error: Failed to sign request for $name" >&2
+        return 1
+    fi
     
     local server_ip
     server_ip=$(cat "$SERVER_IP_FILE" 2>/dev/null || detect_public_ip)
     
-    # ... (ส่วนสร้างไฟล์ .ovpn เหมือนเดิม ไม่ต้องแก้) ...
+    # 2. ปรับปรุงการอ่านไฟล์: อ่านจาก /etc/openvpn/server/ โดยตรง เพื่อความชัวร์
     cat > "$CLIENTS_DIR/${name}.ovpn" <<EOF
 client
 dev tun
@@ -611,7 +617,7 @@ ${CIPHER_FALLBACK}
 key-direction 1
 ${OVPN_VERB}
 <ca>
-$(cat "$CA_CRT")
+$(cat "/etc/openvpn/server/ca.crt")
 </ca>
 <cert>
 $(cat "$PKI_DIR/issued/${name}.crt")
@@ -620,14 +626,14 @@ $(cat "$PKI_DIR/issued/${name}.crt")
 $(cat "$PKI_DIR/private/${name}.key")
 </key>
 <tls-auth>
-$(cat "$TA_KEY")
+$(cat "/etc/openvpn/server/ta.key")
 </tls-auth>
 EOF
 
     # Copy ไปยังโฟลเดอร์ output
     cp "$CLIENTS_DIR/${name}.ovpn" "$CLIENT_OUTPUT_DIR/${name}.ovpn"
     
-    # บรรทัดนี้สำคัญ! ส่งชื่อไฟล์กลับไปให้ do_add_client แสดงผล
+    # ส่งชื่อไฟล์กลับไปแสดงผล
     echo "$CLIENT_OUTPUT_DIR/${name}.ovpn"
 }
 
@@ -641,7 +647,6 @@ do_add_client() {
     file=$(build_client "$name")
     success "Client created: $file"
 }
-
 do_revoke_client() {
     local name="${1:-}"
     [ -z "$name" ] && read -rp "Revoke Client Name: " name
@@ -671,12 +676,14 @@ do_revoke_client() {
         return 1
     fi
     
-    cp "$PKI_DIR/crl.pem" "$OVPN_DIR/crl.pem"
-    chmod 644 "$OVPN_DIR/crl.pem"
+    # --- ส่วนที่แก้ไข: ย้ายไฟล์ไปที่ /etc/openvpn/server/ ---
+    cp "$PKI_DIR/crl.pem" "/etc/openvpn/server/crl.pem"
+    chmod 644 "/etc/openvpn/server/crl.pem"
+    # -----------------------------------------------------
     
-    # 4. เพิ่ม config crl-verify หากยังไม่มี
+    # 4. เพิ่ม config crl-verify หากยังไม่มี (ระบุ Full Path)
     if ! grep -q "crl-verify" "$SERVER_CONF"; then
-        echo "crl-verify crl.pem" >> "$SERVER_CONF"
+        echo "crl-verify /etc/openvpn/server/crl.pem" >> "$SERVER_CONF"
     fi
     
     # 5. ลบไฟล์ Client ทิ้ง
@@ -690,47 +697,216 @@ do_revoke_client() {
     success "Client revoked successfully: $name"
 }
 
-# ====== MENU ======
-show_menu() {
-    clear
-    echo "=== OpenVPN Manager Pro ==="
-    echo "1. Install Server"
-    echo "2. Install Server + Web Dashboard"
-    echo "3. Add Client"
-    echo "4. Revoke Client"
-    echo "5. Web Dashboard Actions (Restart/Logs)"
-    echo "0. Exit"
+do_show_status() {
+    # 1. ส่วนหัว
+    cat << 'EOF'
+╔══════════════════════════════════════════════════╗
+║              OPENVPN SERVER STATUS               ║
+╠══════════════════════════════════════════════════╣
+EOF
+    
+    # 2. Server IP
+    local server_ip
+    if [ -f "$SERVER_IP_FILE" ] && [ -s "$SERVER_IP_FILE" ]; then
+        server_ip=$(cat "$SERVER_IP_FILE")
+    else
+        server_ip=$(detect_public_ip)
+    fi
+    echo "║ Server IP:       $server_ip"
+    
+    # 3. Service Status (เช็ค service มาตรฐาน Ubuntu ใหม่)
+    local service_status="Unknown"
+    local service_color=""
+    
+    if systemctl is-active --quiet openvpn-server@server; then
+        service_status="Active (Running)"
+        service_color="\033[32m" # Green
+    else
+        service_status="Inactive / Failed"
+        service_color="\033[31m" # Red
+    fi
+    echo -e "║ VPN Service:     ${service_color}${service_status}\033[0m"
+    
+    # 4. Port Info
+    echo "║ Port/Protocol:   ${OVPN_PORT}/${OVPN_PROTO}"
+    
+    # 5. Connected Clients (จุดที่แก้ไข Path)
+    # ต้องอ่านจาก /etc/openvpn/server/openvpn-status.log ตาม config ใหม่
+    local status_log="/etc/openvpn/server/openvpn-status.log"
+    local connected_count=0
+    
+    if [ -f "$status_log" ]; then
+        connected_count=$(grep -c "^CLIENT_LIST" "$status_log" 2>/dev/null || echo 0)
+    fi
+    echo "║ Connected Users: $connected_count client(s)"
+    
+    # 6. Web Dashboard Status
+    echo -n "║ Web Dashboard:   "
+    if systemctl is-active --quiet openvpn-web; then
+        echo -e "\033[32mActive (http://$server_ip:$WEB_PORT)\033[0m"
+    else
+        echo -e "\033[31mInactive\033[0m"
+    fi
+    
+    # 7. Firewall Status
+    echo -n "║ Firewall (UFW):  "
+    if ufw status | grep -q "Status: active"; then
+        echo -e "\033[32mActive\033[0m"
+    else
+        echo -e "\033[33mInactive\033[0m"
+    fi
+    
+    # 8. Total Clients Count
+    local total_clients=0
+    if [ -d "$PKI_DIR/issued" ]; then
+        # นับจำนวนไฟล์ .crt ที่ไม่ใช่ server cert
+        total_clients=$(ls -1 "$PKI_DIR/issued" 2>/dev/null | grep -v "${SERVER_NAME_DEFAULT}" | wc -l)
+    fi
+    echo "║ Total Accounts:  $total_clients created"
+    
+    cat << 'EOF'
+╚══════════════════════════════════════════════════╝
+EOF
 }
 
+
+# --- ตั้งค่าสีเพื่อความสวยงาม ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+OPENVPN_SERVICE="openvpn-server@server"  # หรือ openvpn แล้วแต่ OS
+WEB_SERVICE="openvpn-web"
+
+# --- Helper Functions ---
+pause() {
+    echo -e "\n${YELLOW}กดปุ่มใดก็ได้เพื่อดำเนินการต่อ...${NC}"
+    read -n 1 -s -r
+}
+
+header() {
+    clear
+    echo -e "${CYAN}===========================================${NC}"
+    echo -e "${BLUE}       🛡️  OpenVPN Manager Pro v1.1       ${NC}"
+    echo -e "${CYAN}===========================================${NC}"
+}
+
+# --- Function: Check Status (เพิ่มใหม่) ---
+check_status() {
+    header
+    echo -e "${YELLOW}>> System Status Check${NC}"
+    echo ""
+
+    # 1. Check OpenVPN Service
+    if systemctl is-active --quiet "$OPENVPN_SERVICE"; then
+        echo -e "  VPN Service:    [ ${GREEN}● ONLINE${NC} ]"
+    else
+        echo -e "  VPN Service:    [ ${RED}● OFFLINE${NC} ]"
+    fi
+
+    # 2. Check Web Dashboard Service
+    if systemctl is-active --quiet "$WEB_SERVICE"; then
+        echo -e "  Web Dashboard:  [ ${GREEN}● ONLINE${NC} ]"
+    else
+        echo -e "  Web Dashboard:  [ ${RED}● OFFLINE${NC} ]"
+    fi
+
+    echo -e "${CYAN}-------------------------------------------${NC}"
+
+    # 3. System Info
+    # Get Public IP (Timeout 3 วิ กันค้าง)
+    PUBLIC_IP=$(curl -s --connect-timeout 3 ifconfig.me || echo "Unavailable")
+    UPTIME=$(uptime -p | sed 's/up //')
+
+    echo -e "  Public IP:      ${GREEN}$PUBLIC_IP${NC}"
+    echo -e "  Server Uptime:  $UPTIME"
+    
+    echo ""
+}
+
+# --- Sub-Menu สำหรับ Web Dashboard ---
+submenu_web_actions() {
+    while true; do
+        header
+        echo -e "${YELLOW}>> Web Dashboard Actions${NC}"
+        echo ""
+        echo -e "  1) Restart Web Service"
+        echo -e "  2) View Real-time Logs"
+        echo -e "  0) Back to Main Menu"
+        echo ""
+        echo -e "${CYAN}-------------------------------------------${NC}"
+        read -rp "Select action: " w_act
+
+        case "$w_act" in
+            1) 
+                echo -e "${GREEN}Restarting Web Service...${NC}"
+                systemctl restart "$WEB_SERVICE"
+                sleep 1
+                echo -e "${GREEN}Done!${NC}"
+                pause
+                ;;
+            2) 
+                echo -e "${GREEN}Opening logs (Ctrl+C to exit)...${NC}"
+                tail -f "$WEB_LOG_FILE"
+                ;;
+            0) return ;; 
+            *) echo -e "${RED}Invalid option!${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+# --- Main Menu ---
+show_menu() {
+    header
+    echo -e "${YELLOW}Select an option:${NC}"
+    echo ""
+    echo -e "  ${GREEN}1)${NC} Install Server"
+    echo -e "  ${GREEN}2)${NC} Install Server + Web Dashboard"
+    echo -e "  ${GREEN}3)${NC} Add Client"
+    echo -e "  ${GREEN}4)${NC} Revoke Client"
+    echo -e "  ${GREEN}5)${NC} Check Server Status"  # <--- เพิ่มตรงนี้
+    echo -e "  ${GREEN}6)${NC} Web Dashboard Actions" # <--- เลื่อนอันนี้ลงมา
+    echo -e "  ${RED}0)${NC} Exit"
+    echo ""
+    echo -e "${CYAN}-------------------------------------------${NC}"
+}
+
+# --- Main Logic ---
 main() {
     if [ $# -gt 0 ]; then
         case "$1" in
             install) do_install ;;
             add-client) do_add_client "$2" ;;
             revoke-client) do_revoke_client "$2" ;;
-            *) echo "Usage: $0 {install|add-client|revoke-client}" ;;
+            status) check_status ;; # รองรับ command line argument 'status'
+            *) echo -e "${RED}Usage: $0 {install|add-client|revoke-client|status}${NC}"; exit 1 ;;
         esac
         exit 0
     fi
 
     while true; do
         show_menu
-        read -rp "Select: " choice
+        read -rp "Enter choice [0-6]: " choice
+        
         case "$choice" in
             1) do_install ;;
             2) do_install --with-web-dashboard ;;
             3) do_add_client ;;
             4) do_revoke_client ;;
-            5) 
-                echo "1. Restart Web | 2. View Logs"
-                read -rp "Action: " act
-                [ "$act" == "1" ] && systemctl restart openvpn-web
-                [ "$act" == "2" ] && tail -f "$WEB_LOG_FILE"
-                ;;
-            0) exit 0 ;;
+            5) check_status; pause ;; # เรียกฟังก์ชัน Check Status
+            6) submenu_web_actions ;;
+            0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
+            *) echo -e "\n${RED}Error: Invalid option.${NC}"; sleep 1 ;;
         esac
-        pause
+        
+        if [[ "$choice" != "6" && "$choice" != "5" && "$choice" != "0" ]]; then
+            pause
+        fi
     done
 }
 
+# Run
 main "$@"
