@@ -201,22 +201,47 @@ def root(): return RedirectResponse(url="/dashboard")
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(request: Request, user: str = Depends(get_current_user)):
-    # Get Clients
+    # 1. Get Clients (รายชื่อลูกค้าทั้งหมดจากไฟล์ Certificate)
     clients = []
     issued_dir = os.path.join(config["pki_dir"], "issued")
-    if os.path.exists(issued_dir):
-        clients = [f[:-4] for f in os.listdir(issued_dir) if f.endswith(".crt") and f[:-4] != config["server_name"]]
-    
-    # Get Status
-    status_log = "/etc/openvpn/openvpn-status.log"
-    connected = []
-    if os.path.exists(status_log):
-        with open(status_log) as f:
-            connected = [line.split(',')[1] for line in f.read().splitlines() if line.startswith('CLIENT_LIST')]
+    server_name = config.get("server_name", "server") # ป้องกัน error ถ้าไม่มี key นี้
 
+    if os.path.exists(issued_dir):
+        try:
+            clients = [
+                f[:-4] for f in os.listdir(issued_dir) 
+                if f.endswith(".crt") and f[:-4] != server_name
+            ]
+        except OSError as e:
+            print(f"Error reading PKI dir: {e}")
+    
+    # 2. Get Status (รายชื่อคนที่ Online จาก Status Log)
+    # ใช้ Path จาก Config ถ้าไม่มีให้ใช้ค่า Default
+    status_log = config.get("status_log", "/etc/openvpn/server/openvpn-status.log")
+    connected = []
+
+    if os.path.exists(status_log):
+        try:
+            with open(status_log, 'r') as f:
+                for line in f:
+                    # Log Format OpenVPN ส่วนใหญ่: CLIENT_LIST,CommonName,RealAddress,VirtualAddress,...
+                    # เราสนใจแค่บรรทัดที่ขึ้นต้นด้วย CLIENT_LIST
+                    if line.startswith('CLIENT_LIST'):
+                        parts = line.split(',')
+                        # เช็คว่ามีข้อมูลเพียงพอหรือไม่ (ป้องกัน IndexError)
+                        if len(parts) > 1:
+                            client_name = parts[1]
+                            connected.append(client_name)
+        except Exception as e:
+            print(f"Error reading status log: {e}")
+
+    # 3. Return Template
     return templates.TemplateResponse("dashboard.html", {
-        "request": request, "clients": sorted(clients), "connected": connected, 
-        "username": user, "server_name": config["server_name"]
+        "request": request, 
+        "clients": sorted(clients), 
+        "connected": connected, 
+        "username": user, 
+        "server_name": server_name
     })
 
 @app.post("/api/clients")
