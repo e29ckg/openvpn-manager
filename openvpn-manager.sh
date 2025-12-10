@@ -430,12 +430,12 @@ install_web_dashboard() {
     info "URL: http://$ip:$WEB_PORT"
     info "User: admin / Pass: vpn"
 }
-
-# ====== OPENVPN SERVER ======
+# ====== OPENVPN SERVER (FIXED) ======
 
 ensure_dirs() { 
     mkdir -p "$CLIENTS_DIR"
     mkdir -p "$CLIENT_OUTPUT_DIR"
+    # สร้างโฟลเดอร์มาตรฐานสำหรับ Server config
     mkdir -p "/etc/openvpn/server"
 }
 
@@ -458,11 +458,13 @@ build_pki_server() {
     cd "$EASYRSA_DIR"
     export EASYRSA_BATCH=1
     
+    # Init PKI
     if [ ! -d "$PKI_DIR" ]; then
         ./easyrsa init-pki
         ./easyrsa build-ca nopass
     fi
     
+    # Build Server Cert
     if [ ! -f "$PKI_DIR/issued/${SERVER_NAME_DEFAULT}.crt" ]; then
         ./easyrsa gen-req "${SERVER_NAME_DEFAULT}" nopass
         ./easyrsa sign-req server "${SERVER_NAME_DEFAULT}"
@@ -470,16 +472,25 @@ build_pki_server() {
         openvpn --genkey --secret ta.key
     fi
 
-    # Install certs
-    cp "$PKI_DIR/ca.crt" "$CA_CRT"
-    cp "$PKI_DIR/private/${SERVER_NAME_DEFAULT}.key" "$SERVER_KEY"
-    cp "$PKI_DIR/issued/${SERVER_NAME_DEFAULT}.crt" "$SERVER_CRT"
-    cp "$PKI_DIR/dh.pem" "$DH_PEM"
-    cp ta.key "$TA_KEY"
+    # --- ส่วนที่แก้ไข: ย้ายไฟล์เข้า /etc/openvpn/server/ ---
+    info "Copying certificates to server directory..."
+    cp "$PKI_DIR/ca.crt" "/etc/openvpn/server/ca.crt"
+    cp "$PKI_DIR/private/${SERVER_NAME_DEFAULT}.key" "/etc/openvpn/server/${SERVER_NAME_DEFAULT}.key"
+    cp "$PKI_DIR/issued/${SERVER_NAME_DEFAULT}.crt" "/etc/openvpn/server/${SERVER_NAME_DEFAULT}.crt"
+    cp "$PKI_DIR/dh.pem" "/etc/openvpn/server/dh.pem"
+    cp ta.key "/etc/openvpn/server/ta.key"
+    
+    # กำหนดสิทธิ์ไฟล์ Key (เพื่อความปลอดภัย)
+    chmod 600 /etc/openvpn/server/*.key
 }
 
 write_server_conf() {
-    cat > "$SERVER_CONF" <<EOF
+    # --- ส่วนที่แก้ไข: เขียนลง /etc/openvpn/server/ โดยตรง ---
+    local conf_path="/etc/openvpn/server/server.conf"
+    
+    info "Writing server config to $conf_path"
+    
+    cat > "$conf_path" <<EOF
 port ${OVPN_PORT}
 proto ${OVPN_PROTO}
 dev tun
@@ -490,20 +501,21 @@ persist-tun
 topology subnet
 server ${VPN_NET} ${VPN_MASK}
 ifconfig-pool-persist ipp.txt
-ca $(basename "$CA_CRT")
-cert $(basename "$SERVER_CRT")
-key $(basename "$SERVER_KEY")
-dh $(basename "$DH_PEM")
+# ใช้ Full Path เพื่อป้องกันปัญหาหาไฟล์ไม่เจอ
+ca /etc/openvpn/server/ca.crt
+cert /etc/openvpn/server/${SERVER_NAME_DEFAULT}.crt
+key /etc/openvpn/server/${SERVER_NAME_DEFAULT}.key
+dh /etc/openvpn/server/dh.pem
 ${AUTH_ALG}
 ${CIPHER_LINE}
 ${CIPHER_FALLBACK}
-tls-auth $(basename "$TA_KEY") 0
+tls-auth /etc/openvpn/server/ta.key 0
 remote-cert-tls client
 push "redirect-gateway def1 bypass-dhcp"
 push "dhcp-option DNS 8.8.8.8"
 push "dhcp-option DNS 1.1.1.1"
 keepalive 10 120
-status $(basename "$STATUS_LOG")
+status /etc/openvpn/server/openvpn-status.log
 ${OVPN_VERB}
 EOF
 }
